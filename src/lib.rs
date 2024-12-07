@@ -1,11 +1,16 @@
 use core::fmt::{Debug, Display};
 use core::ops::{Deref, DerefMut};
-use core::time::Duration;
-pub use std::sync::WaitTimeoutResult;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::thread::{Thread, ThreadId};
 
-pub struct Mutex<T>(std::sync::Mutex<T>, std::sync::Condvar);
+type Condition<T> = Box<dyn Fn(&T) -> bool + Send>;
 
-pub struct MutexGuard<'a, 'b, T>(Option<std::sync::MutexGuard<'b, T>>, &'a std::sync::Condvar);
+type CondMap<T> = HashMap<ThreadId, (Thread, Condition<T>)>;
+
+pub struct Mutex<T>(std::sync::Mutex<T>, std::sync::Mutex<CondMap<T>>);
+
+pub struct MutexGuard<'a, 'b, T>(Option<std::sync::MutexGuard<'b, T>>, &'a Mutex<T>);
 
 impl<T> Mutex<T> {
     pub fn new(t: T) -> Self {
@@ -14,28 +19,41 @@ impl<T> Mutex<T> {
 
     pub fn lock(&self) -> MutexGuard<T> {
         let guard = self.0.lock().unwrap();
-        MutexGuard(Some(guard), &self.1)
+        MutexGuard(Some(guard), &self)
     }
 
-    pub fn lock_when(&self, condition: impl Fn(&T) -> bool) -> MutexGuard<T> {
+    pub fn lock_when<F: Fn(&T) -> bool + Send>(&self, condition: F) -> MutexGuard<T> {
         let guard = self.0.lock().unwrap();
-        let guard = self.1.wait_while(guard, |t| !condition(t)).unwrap();
-        MutexGuard(Some(guard), &self.1)
-    }
+        if condition(guard.deref()) {
+            return MutexGuard(Some(guard), &self);
+        }
+        drop(guard);
 
-    pub fn lock_when_with_timeout(
-        &self,
-        condition: impl Fn(&T) -> bool,
-        timeout: Duration,
-    ) -> Result<MutexGuard<T>, WaitTimeoutResult> {
-        let guard = self.0.lock().unwrap();
-        let (guard, timed_out) = self
-            .1
-            .wait_timeout_while(guard, timeout, |t| !condition(t))
-            .unwrap();
-        match timed_out.timed_out() {
-            true => Err(timed_out),
-            false => Ok(MutexGuard(Some(guard), &self.1)),
+        let thread = std::thread::current();
+        let id = thread.id();
+        fn boxed<'a, T>(f: impl Fn(&T) -> bool + Send + 'a) -> Box<dyn Fn(&T) -> bool + Send> {
+            let f: Box<dyn Fn(&T) -> bool + Send + 'a> = Box::new(f);
+            unsafe { core::mem::transmute(f) }
+        }
+        let condition: Condition<T> = boxed(condition);
+        let mut mapguard = self.1.lock().unwrap();
+        mapguard.insert(id, (thread, condition));
+        drop(mapguard);
+
+        loop {
+            std::thread::park();
+            let guard = self.0.lock().unwrap();
+            let mut mapguard = self.1.lock().unwrap();
+            let Entry::Occupied(entry) = mapguard.entry(id) else {
+                panic!();
+            };
+            // TODO:  It's a pity we have to retake the lock and recheck the condition.
+            // parking_lot::MutexGuard can be Send; try implementing in terms of that.
+            if entry.get().1(guard.deref()) {
+                let _dealloc = entry.remove();
+                drop(mapguard);
+                return MutexGuard(Some(guard), &self);
+            }
         }
     }
 
@@ -43,29 +61,17 @@ impl<T> Mutex<T> {
         self.0
             .try_lock()
             .ok()
-            .map(|guard| MutexGuard(Some(guard), &self.1))
-    }
-}
-
-impl<T> MutexGuard<'_, '_, T> {
-    pub fn await_condition(&mut self, condition: impl Fn(&T) -> bool) {
-        let guard = self.0.take().unwrap();
-        let guard = self.1.wait_while(guard, |t| !condition(t)).unwrap();
-        self.0 = Some(guard);
+            .map(|guard| MutexGuard(Some(guard), &self))
     }
 
-    pub fn await_with_timeout(
-        &mut self,
-        condition: impl Fn(&T) -> bool,
-        timeout: Duration,
-    ) -> bool {
-        let guard = self.0.take().unwrap();
-        let (guard, timed_out) = self
-            .1
-            .wait_timeout_while(guard, timeout, |t| !condition(t))
-            .unwrap();
-        self.0 = Some(guard);
-        !timed_out.timed_out()
+    fn release(&self, guard: std::sync::MutexGuard<T>) {
+        let mapguard = self.1.lock().unwrap();
+        for v in mapguard.values() {
+            if v.1(guard.deref()) {
+                v.0.unpark();
+                break;
+            }
+        }
     }
 }
 
@@ -107,7 +113,7 @@ impl<T> DerefMut for MutexGuard<'_, '_, T> {
 
 impl<T> Drop for MutexGuard<'_, '_, T> {
     fn drop(&mut self) {
-        self.1.notify_all();
+        self.1.release(self.0.take().unwrap())
     }
 }
 

@@ -1,5 +1,8 @@
 [package]
-name = "ccs"
-description = "Conditional Critical Sections"
+name = "ccs_mutex"
 version = "0.1.0"
 edition = "2021"
+license = "0BSD"
+description = "Conditional Critical Sections"
+repository = "https://github.com/a6f/ccs_mutex"
+readme = "README.md"

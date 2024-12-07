@@ -8,9 +8,9 @@ type Condition<T> = Box<dyn Fn(&T) -> bool + Send>;
 
 type CondMap<T> = HashMap<ThreadId, (Thread, Condition<T>)>;
 
-pub struct Mutex<T>(std::sync::Mutex<T>, std::sync::Mutex<CondMap<T>>);
+pub struct Mutex<T>(parking_lot::Mutex<T>, parking_lot::Mutex<CondMap<T>>);
 
-pub struct MutexGuard<'a, 'b, T>(Option<std::sync::MutexGuard<'b, T>>, &'a Mutex<T>);
+pub struct MutexGuard<'a, 'b, T>(Option<parking_lot::MutexGuard<'b, T>>, &'a Mutex<T>);
 
 impl<T> Mutex<T> {
     pub fn new(t: T) -> Self {
@@ -18,12 +18,12 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<T> {
-        let guard = self.0.lock().unwrap();
+        let guard = self.0.lock();
         MutexGuard(Some(guard), &self)
     }
 
     pub fn lock_when<F: Fn(&T) -> bool + Send>(&self, condition: F) -> MutexGuard<T> {
-        let guard = self.0.lock().unwrap();
+        let guard = self.0.lock();
         if condition(guard.deref()) {
             return MutexGuard(Some(guard), &self);
         }
@@ -36,14 +36,14 @@ impl<T> Mutex<T> {
             unsafe { core::mem::transmute(f) }
         }
         let condition: Condition<T> = boxed(condition);
-        let mut mapguard = self.1.lock().unwrap();
+        let mut mapguard = self.1.lock();
         mapguard.insert(id, (thread, condition));
         drop(mapguard);
 
         loop {
             std::thread::park();
-            let guard = self.0.lock().unwrap();
-            let mut mapguard = self.1.lock().unwrap();
+            let guard = self.0.lock();
+            let mut mapguard = self.1.lock();
             let Entry::Occupied(entry) = mapguard.entry(id) else {
                 panic!();
             };
@@ -60,12 +60,11 @@ impl<T> Mutex<T> {
     pub fn try_lock(&self) -> Option<MutexGuard<T>> {
         self.0
             .try_lock()
-            .ok()
             .map(|guard| MutexGuard(Some(guard), &self))
     }
 
-    fn release(&self, guard: std::sync::MutexGuard<T>) {
-        let mapguard = self.1.lock().unwrap();
+    fn release(&self, guard: parking_lot::MutexGuard<T>) {
+        let mapguard = self.1.lock();
         for v in mapguard.values() {
             if v.1(guard.deref()) {
                 v.0.unpark();

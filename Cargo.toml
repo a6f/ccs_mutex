@@ -3,3 +3,6 @@ name = "ccs"
 description = "Conditional Critical Sections"
 version = "0.1.0"
 edition = "2021"
+
+[dependencies]
+parking_lot = { version = "0.12.3", features = ["send_guard"] }

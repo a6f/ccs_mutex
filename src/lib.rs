@@ -1,13 +1,20 @@
+use core::cell::UnsafeCell;
 use core::fmt::{Debug, Display};
 use core::ops::{Deref, DerefMut};
-use std::collections::hash_map::Entry;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::thread::{Thread, ThreadId};
 
 type Condition<T> = Box<dyn Fn(&T) -> bool + Send>;
 
-type CondMap<T> = HashMap<ThreadId, (Thread, Condition<T>)>;
+type LockSlot<'a, T> = (
+    AtomicBool,
+    UnsafeCell<Option<parking_lot::MutexGuard<'a, T>>>,
+);
 
+type CondMap<T> = HashMap<ThreadId, (Thread, Condition<T>, usize)>;
+
+// TODO: can we get this down to one lock?
 pub struct Mutex<T>(parking_lot::Mutex<T>, parking_lot::Mutex<CondMap<T>>);
 
 pub struct MutexGuard<'a, 'b, T>(Option<parking_lot::MutexGuard<'b, T>>, &'a Mutex<T>);
@@ -36,22 +43,16 @@ impl<T> Mutex<T> {
             unsafe { core::mem::transmute(f) }
         }
         let condition: Condition<T> = boxed(condition);
+        let slot: LockSlot<T> = Default::default();
+        let addr = &slot as *const _ as usize;
         let mut mapguard = self.1.lock();
-        mapguard.insert(id, (thread, condition));
+        mapguard.insert(id, (thread, condition, addr));
         drop(mapguard);
 
         loop {
             std::thread::park();
-            let guard = self.0.lock();
-            let mut mapguard = self.1.lock();
-            let Entry::Occupied(entry) = mapguard.entry(id) else {
-                panic!();
-            };
-            // TODO:  It's a pity we have to retake the lock and recheck the condition.
-            // parking_lot::MutexGuard can be Send; try implementing in terms of that.
-            if entry.get().1(guard.deref()) {
-                let _dealloc = entry.remove();
-                drop(mapguard);
+            if slot.0.load(Ordering::Acquire) {
+                let guard = slot.1.into_inner().unwrap();
                 return MutexGuard(Some(guard), &self);
             }
         }
@@ -64,12 +65,21 @@ impl<T> Mutex<T> {
     }
 
     fn release(&self, guard: parking_lot::MutexGuard<T>) {
-        let mapguard = self.1.lock();
-        for v in mapguard.values() {
+        let mut mapguard = self.1.lock();
+        // TODO:  Would extract_if() be faster?  Does it visit the remaining entries when dropped?
+        let mut rm = None;
+        for (k, v) in mapguard.iter() {
             if v.1(guard.deref()) {
+                let slot: &LockSlot<T> = unsafe { &*(v.2 as *const LockSlot<T>) };
+                unsafe { *slot.1.get() = Some(guard) };
+                slot.0.store(true, Ordering::Release);
                 v.0.unpark();
+                rm = Some(k.clone());
                 break;
             }
+        }
+        if let Some(ref k) = rm {
+            mapguard.remove(k);
         }
     }
 }
